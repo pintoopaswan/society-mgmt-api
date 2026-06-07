@@ -1,0 +1,397 @@
+// ============================================================
+//  Society Management System — Prisma Schema
+//  Stack: PostgreSQL 16 on Supabase, Prisma 7.x
+//  Connection config lives in prisma.config.ts (Prisma 7+)
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ENUMS
+// ─────────────────────────────────────────────────────────────
+
+enum FlatType {
+  BHK_1
+  BHK_2
+  BHK_3
+  STUDIO
+  COMMERCIAL
+}
+
+enum FlatStatus {
+  VACANT
+  OWNER_OCCUPIED
+  RENTED
+  LOCKED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  PARTIAL
+  WAIVED
+  OVERDUE
+}
+
+enum PaymentMode {
+  ONLINE
+  CASH
+  UPI
+  NEFT
+  CHEQUE
+}
+
+enum TxnStatus {
+  INITIATED
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+enum ExpenseCategory {
+  MAINTENANCE
+  UTILITIES
+  SECURITY
+  REPAIR
+  SALARY
+  MISC
+}
+
+enum VehicleType {
+  CAR
+  BIKE
+  SCOOTER
+  CYCLE
+  OTHER
+}
+
+enum ContactCategory {
+  AMBULANCE
+  FIRE
+  POLICE
+  DOCTOR
+  PLUMBER
+  ELECTRICIAN
+  OTHER
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  ADMIN
+  TREASURER
+  RESIDENT
+  GUARD
+}
+
+enum LedgerType {
+  CREDIT
+  DEBIT
+}
+
+// ─────────────────────────────────────────────────────────────
+//  PROPERTY DOMAIN
+// ─────────────────────────────────────────────────────────────
+
+model Block {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  description String?
+  totalFlats  Int
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  flats Flat[]
+
+  @@map("blocks")
+}
+
+model Flat {
+  id                 String     @id @default(uuid())
+  blockId            String
+  flatNumber         String
+  floor              Int
+  area               Decimal?
+  type               FlatType
+  status             FlatStatus
+  monthlyMaintenance Decimal
+  isActive           Boolean    @default(true)
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+
+  block    Block  @relation(fields: [blockId], references: [id])
+
+  ownerships  Ownership[]
+  tenancies   Tenancy[]
+  vehicles    Vehicle[]
+  payments    MaintenancePayment[]
+
+  @@unique([blockId, flatNumber])
+  @@index([status])
+  @@map("flats")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  RESIDENTS DOMAIN
+// ─────────────────────────────────────────────────────────────
+
+model Person {
+  id           String   @id @default(uuid())
+  name         String
+  phone        String   @unique
+  altPhone     String?
+  email        String?  @unique
+  aadhaarLast4 String?
+  panNumber    String?
+  photoUrl     String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  ownerships        Ownership[]
+  tenancies         Tenancy[]
+  vehicles          Vehicle[]
+  emergencyContacts EmergencyContact[]
+
+  @@map("persons")
+}
+
+model Ownership {
+  id           String    @id @default(uuid())
+  flatId       String
+  personId     String
+  sharePercent Decimal   @default(100)
+  startDate    DateTime
+  endDate      DateTime?
+  isPrimary    Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+
+  flat   Flat   @relation(fields: [flatId], references: [id])
+  person Person @relation(fields: [personId], references: [id])
+
+  @@index([flatId, endDate])
+  @@map("ownerships")
+}
+
+model Tenancy {
+  id           String    @id @default(uuid())
+  flatId       String
+  tenantId     String
+  agreementUrl String?
+  startDate    DateTime
+  endDate      DateTime?
+  rentAmount   Decimal
+  deposit      Decimal
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  flat   Flat   @relation(fields: [flatId], references: [id])
+  person Person @relation(fields: [tenantId], references: [id])
+
+  @@index([flatId, isActive])
+  @@map("tenancies")
+}
+
+model Vehicle {
+  id          String      @id @default(uuid())
+  flatId      String
+  personId    String
+  type        VehicleType
+  plateNumber String      @unique
+  make        String?
+  model       String?
+  color       String?
+  parkingSlot String?
+  isActive    Boolean     @default(true)
+  createdAt   DateTime    @default(now())
+
+  flat   Flat   @relation(fields: [flatId], references: [id])
+  person Person @relation(fields: [personId], references: [id])
+
+  @@map("vehicles")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  FINANCE DOMAIN
+// ─────────────────────────────────────────────────────────────
+
+model MaintenancePayment {
+  id           String        @id @default(uuid())
+  flatId       String
+  billingMonth String
+  amount       Decimal
+  lateFee      Decimal       @default(0)
+  totalAmount  Decimal
+  status       PaymentStatus
+  dueDate      DateTime
+  paidAt       DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  flat         Flat                 @relation(fields: [flatId], references: [id])
+  transactions PaymentTransaction[]
+  receipt      PaymentReceipt?
+
+  @@unique([flatId, billingMonth])
+  @@index([status, dueDate])
+  @@map("maintenance_payments")
+}
+
+model PaymentTransaction {
+  id                String      @id @default(uuid())
+  maintenanceId     String?
+  guardPaymentId    String?
+  expenseId         String?
+  razorpayOrderId   String?     @unique
+  razorpayPaymentId String?     @unique
+  razorpaySignature String?
+  amount            Decimal
+  currency          String      @default("INR")
+  mode              PaymentMode
+  status            TxnStatus
+  gateway           String?
+  gatewayResponse   Json?
+  notes             String?
+  processedAt       DateTime?
+  createdAt         DateTime    @default(now())
+
+  maintenance  MaintenancePayment? @relation(fields: [maintenanceId], references: [id])
+  guardPayment GuardPayment?       @relation(fields: [guardPaymentId], references: [id])
+  expense      Expense?            @relation(fields: [expenseId], references: [id])
+
+  @@index([status, createdAt])
+  @@map("payment_transactions")
+}
+
+model PaymentReceipt {
+  id            String    @id @default(uuid())
+  maintenanceId String    @unique
+  receiptNumber String    @unique
+  pdfUrl        String?
+  issuedAt      DateTime  @default(now())
+  sentAt        DateTime?
+
+  maintenance MaintenancePayment @relation(fields: [maintenanceId], references: [id])
+
+  @@map("payment_receipts")
+}
+
+model GuardPayment {
+  id         String        @id @default(uuid())
+  guardName  String
+  month      String
+  daysWorked Int
+  dailyRate  Decimal
+  bonus      Decimal       @default(0)
+  deductions Decimal       @default(0)
+  netAmount  Decimal
+  status     PaymentStatus
+  paidAt     DateTime?
+  createdAt  DateTime      @default(now())
+
+  transactions PaymentTransaction[]
+
+  @@unique([guardName, month])
+  @@map("guard_payments")
+}
+
+model Expense {
+  id          String          @id @default(uuid())
+  category    ExpenseCategory
+  description String
+  amount      Decimal
+  vendor      String?
+  invoiceUrl  String?
+  expenseDate DateTime
+  approvedBy  String?
+  createdAt   DateTime        @default(now())
+
+  transactions PaymentTransaction[]
+
+  @@index([category, expenseDate])
+  @@map("expenses")
+}
+
+model FundLedger {
+  id          String     @id @default(uuid())
+  entryType   LedgerType
+  amount      Decimal
+  balance     Decimal
+  description String
+  referenceId String?
+  entryDate   DateTime
+  createdAt   DateTime   @default(now())
+
+  @@index([entryDate])
+  @@map("fund_ledger")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  OPERATIONS DOMAIN
+// ─────────────────────────────────────────────────────────────
+
+model EmergencyContact {
+  id        String          @id @default(uuid())
+  personId  String?
+  name      String
+  phone     String
+  altPhone  String?
+  category  ContactCategory
+  notes     String?
+  isActive  Boolean         @default(true)
+  createdAt DateTime        @default(now())
+
+  person Person? @relation(fields: [personId], references: [id])
+
+  @@map("emergency_contacts")
+}
+
+model Announcement {
+  id          String    @id @default(uuid())
+  title       String
+  body        String
+  category    String
+  isPublished Boolean   @default(false)
+  publishedAt DateTime?
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([isPublished, expiresAt])
+  @@map("announcements")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  tableName String
+  recordId  String
+  action    String
+  oldValues Json?
+  newValues Json?
+  changedBy String?
+  changedAt DateTime @default(now())
+  ipAddress String?
+
+  @@index([tableName, recordId])
+  @@index([changedAt])
+  @@map("audit_logs")
+}
+
+model User {
+  id        String    @id @default(uuid())
+  personId  String?   @unique
+  email     String    @unique
+  role      UserRole
+  isActive  Boolean   @default(true)
+  lastLogin DateTime?
+  createdAt DateTime  @default(now())
+
+  @@map("users")
+}
