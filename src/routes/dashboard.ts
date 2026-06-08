@@ -2,6 +2,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { prisma } from '../lib/prisma'
+import { cacheGet, cacheSet } from '../lib/cache'
 import { ok, created, handleError } from '../lib/response'
 
 const router = Router()
@@ -9,6 +10,11 @@ const router = Router()
 // ── GET /dashboard — main KPI summary ────────────────────────
 router.get('/dashboard', async (req, res) => {
   try {
+    // Try cache first
+    const cacheKey = 'dashboard:summary'
+    const cached = await cacheGet(cacheKey)
+    if (cached) return ok(res, JSON.parse(cached))
+
     const now          = new Date()
     const billingMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
 
@@ -102,6 +108,25 @@ router.get('/dashboard', async (req, res) => {
       recentPayments,
       topDefaulters,
     })
+    // Cache result for 30 seconds
+    try { await cacheSet(cacheKey, JSON.stringify({
+      flats: { total: totalFlats, occupied: occupiedFlats, vacant: vacantFlats },
+      residents: { total: totalResidents },
+      currentMonth: {
+        billingMonth,
+        paid:           paidCount,
+        pending:        statsMap['PENDING']?.count ?? 0,
+        overdue:        statsMap['OVERDUE']?.count ?? 0,
+        collected:      statsMap['PAID']?.amount ?? 0,
+        collectionRate: totalBilled > 0 ? Math.round((paidCount / totalBilled) * 100) : 0,
+      },
+      fund: {
+        balance:   fundBalance?.balance ?? 0,
+        asOf:      fundBalance?.entryDate ?? null,
+      },
+      recentPayments,
+      topDefaulters,
+    }), 30) } catch (e) { /* ignore cache set errors */ }
   } catch (err) { return handleError(res, err) }
 })
 

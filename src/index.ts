@@ -2,6 +2,9 @@
 import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
+import compression from 'compression'
+import responseTime from 'response-time'
+import pinoHttp from 'pino-http'
 
 import flatsRouter     from './routes/flats'
 import residentsRouter from './routes/residents'
@@ -21,6 +24,17 @@ app.use(cors({
     callback(new Error('Not allowed by CORS'))
   },
   credentials: true,
+}))
+
+// Performance middleware
+app.use(compression())
+app.use(pinoHttp())
+app.use(responseTime((req, _res, time) => {
+  // Log slow requests (threshold 200ms) via console; pino-http also captures requests
+  if (time > 200) {
+    // req may not be typed here; use any to avoid TS errors
+    ;(req as any).log?.warn?.({ path: (req as any).path, method: (req as any).method, time }, 'slow_request')
+  }
 }))
 
 app.use('/api/razorpay/webhook', express.raw({ type: 'application/json' }))

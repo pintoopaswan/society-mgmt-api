@@ -12,226 +12,129 @@ router.get('/search', async (req, res) => {
     const q = (req.query.q as string)?.trim()
     if (!q || q.length < 2) return ok(res, [])
 
-    const isPhone   = /^\d+$/.test(q)
-    const isFlat    = /^\d{3}$/.test(q)                    // e.g. "101"
-    const isPlate   = /^[A-Z]{2}\d{2}/.test(q.toUpperCase()) // e.g. "CG04AB1234"
+    const isPhone = /^\d+$/.test(q)
+    const isFlat = /^\d{3}$/.test(q)
+    const isPlate = /^[A-Z]{2}\d{2}/.test(q.toUpperCase())
+    const qUpper = q.toUpperCase()
 
     const results: any[] = []
 
-    // ── 1. Search by vehicle plate ────────────────────────────
-    if (isPlate || (!isPhone && !isFlat)) {
-      const vehicles = await prisma.vehicle.findMany({
-        where: {
-          plateNumber: { contains: q.toUpperCase() },
-          isActive:    true,
-        },
-        include: {
-          person: true,
-          flat:   { include: { block: true } },
-        },
-        take: 5,
-      })
-
-      for (const v of vehicles) {
-        results.push({
-          type:        'vehicle',
-          matchedOn:   'Vehicle No.',
-          matchedValue: v.plateNumber,
-          person: {
-            id:    v.person.id,
-            name:  v.person.name,
-            phone: v.person.phone,
+    // Prepare queries but run in parallel to avoid sequential DB waits
+    const vehicleQuery = (isPlate || (!isPhone && !isFlat))
+      ? prisma.vehicle.findMany({
+          where: { plateNumber: { contains: qUpper }, isActive: true },
+          select: {
+            plateNumber: true,
+            type: true,
+            make: true,
+            color: true,
+            person: { select: { id: true, name: true, phone: true } },
+            flat: { select: { id: true, flatNumber: true, status: true, block: { select: { id: true, name: true } } } },
           },
-          flat: {
-            id:          v.flat.id,
-            block:       v.flat.block.name,
-            flatNumber:  v.flat.flatNumber,
-            status:      v.flat.status,
-          },
-          vehicle: {
-            plateNumber: v.plateNumber,
-            type:        v.type,
-            make:        v.make,
-            color:       v.color,
-          },
-          role: 'Owner',
+          take: 5,
         })
-      }
-    }
+      : Promise.resolve([])
 
-    // ── 2. Search by flat number ──────────────────────────────
-    if (isFlat || (!isPhone && !isPlate)) {
-      const flats = await prisma.flat.findMany({
-        where: {
-          flatNumber: { contains: q },
-          isActive:   true,
-        },
-        include: {
-          block:      true,
-          ownerships: {
-            where:   { endDate: null },
-            include: { person: true },
+    const flatsQuery = (isFlat || (!isPhone && !isPlate))
+      ? prisma.flat.findMany({
+          where: { flatNumber: { contains: q }, isActive: true },
+          select: {
+            id: true,
+            flatNumber: true,
+            status: true,
+            block: { select: { id: true, name: true } },
+            ownerships: { where: { endDate: null }, select: { person: { select: { id: true, name: true, phone: true } } } },
+            tenancies: { where: { isActive: true }, select: { person: { select: { id: true, name: true, phone: true } } } },
           },
-          tenancies: {
-            where:   { isActive: true },
-            include: { person: true },
-          },
-        },
-        take: 10,
-      })
+          take: 10,
+        })
+      : Promise.resolve([])
 
-      for (const f of flats) {
-        // Add owners
-        for (const o of f.ownerships) {
-          results.push({
-            type:        'flat',
-            matchedOn:   'Flat No.',
-            matchedValue: `${f.block.name} · ${f.flatNumber}`,
-            person: {
-              id:    o.person.id,
-              name:  o.person.name,
-              phone: o.person.phone,
-            },
-            flat: {
-              id:         f.id,
-              block:      f.block.name,
-              flatNumber: f.flatNumber,
-              status:     f.status,
-            },
-            role: 'Owner',
-          })
-        }
-        // Add tenants
-        for (const t of f.tenancies) {
-          results.push({
-            type:        'flat',
-            matchedOn:   'Flat No.',
-            matchedValue: `${f.block.name} · ${f.flatNumber}`,
-            person: {
-              id:    t.person.id,
-              name:  t.person.name,
-              phone: t.person.phone,
-            },
-            flat: {
-              id:         f.id,
-              block:      f.block.name,
-              flatNumber: f.flatNumber,
-              status:     f.status,
-            },
-            role: 'Tenant',
-          })
-        }
-        // Vacant flat with no occupants
-        if (f.ownerships.length === 0 && f.tenancies.length === 0) {
-          results.push({
-            type:        'flat',
-            matchedOn:   'Flat No.',
-            matchedValue: `${f.block.name} · ${f.flatNumber}`,
-            person:      null,
-            flat: {
-              id:         f.id,
-              block:      f.block.name,
-              flatNumber: f.flatNumber,
-              status:     f.status,
-            },
-            role: null,
-          })
-        }
-      }
-    }
-
-    // ── 3. Search by person name or phone ─────────────────────
-    const persons = await prisma.person.findMany({
+    const personsQuery = prisma.person.findMany({
       where: {
         isActive: true,
         OR: [
-          { name:  { contains: q, mode: 'insensitive' } },
+          { name: { contains: q, mode: 'insensitive' } },
           { phone: { contains: q } },
           ...(q.length >= 3 ? [{ altPhone: { contains: q } }] : []),
         ],
       },
-      include: {
-        ownerships: {
-          where:   { endDate: null },
-          include: { flat: { include: { block: true } } },
-        },
-        tenancies: {
-          where:   { isActive: true },
-          include: { flat: { include: { block: true } } },
-        },
-        vehicles: { where: { isActive: true } },
+      select: {
+        id: true,
+        name: true,
+        phone: true,
+        altPhone: true,
+        email: true,
+        ownerships: { where: { endDate: null }, select: { flat: { select: { id: true, flatNumber: true, status: true, block: { select: { id: true, name: true } } } } } },
+        tenancies: { where: { isActive: true }, select: { flat: { select: { id: true, flatNumber: true, status: true, block: { select: { id: true, name: true } } } } } },
+        vehicles: { where: { isActive: true }, select: { plateNumber: true, type: true, make: true, color: true } },
       },
       take: 20,
     })
 
-    for (const p of persons) {
-      const matchedOn = p.phone.includes(q) ? 'Phone' : p.altPhone?.includes(q) ? 'Alt Phone' : 'Name'
+    const [vehicles, flats, persons] = await Promise.all([vehicleQuery, flatsQuery, personsQuery])
 
-      // Owner entries
-      for (const o of p.ownerships) {
+    // Process vehicles
+    for (const v of vehicles) {
+      results.push({
+        type: 'vehicle',
+        matchedOn: 'Vehicle No.',
+        matchedValue: v.plateNumber,
+        person: v.person ? { id: v.person.id, name: v.person.name, phone: v.person.phone } : null,
+        flat: v.flat ? { id: v.flat.id, block: v.flat.block.name, flatNumber: v.flat.flatNumber, status: v.flat.status } : null,
+        vehicle: { plateNumber: v.plateNumber, type: v.type, make: v.make, color: v.color },
+        role: 'Owner',
+      })
+    }
+
+    // Process flats
+    for (const f of flats) {
+      const label = `${f.block.name} · ${f.flatNumber}`
+      for (const o of f.ownerships) {
         results.push({
-          type:        'person',
-          matchedOn,
-          matchedValue: matchedOn === 'Name' ? p.name : p.phone,
-          person: {
-            id:       p.id,
-            name:     p.name,
-            phone:    p.phone,
-            altPhone: p.altPhone,
-            email:    p.email,
-          },
-          flat: {
-            id:         o.flat.id,
-            block:      o.flat.block.name,
-            flatNumber: o.flat.flatNumber,
-            status:     o.flat.status,
-          },
-          vehicles: p.vehicles,
+          type: 'flat',
+          matchedOn: 'Flat No.',
+          matchedValue: label,
+          person: { id: o.person.id, name: o.person.name, phone: o.person.phone },
+          flat: { id: f.id, block: f.block.name, flatNumber: f.flatNumber, status: f.status },
           role: 'Owner',
         })
       }
-
-      // Tenant entries
-      for (const t of p.tenancies) {
+      for (const t of f.tenancies) {
         results.push({
-          type:        'person',
-          matchedOn,
-          matchedValue: matchedOn === 'Name' ? p.name : p.phone,
-          person: {
-            id:       p.id,
-            name:     p.name,
-            phone:    p.phone,
-            altPhone: p.altPhone,
-            email:    p.email,
-          },
-          flat: {
-            id:         t.flat.id,
-            block:      t.flat.block.name,
-            flatNumber: t.flat.flatNumber,
-            status:     t.flat.status,
-          },
-          vehicles: p.vehicles,
+          type: 'flat',
+          matchedOn: 'Flat No.',
+          matchedValue: label,
+          person: { id: t.person.id, name: t.person.name, phone: t.person.phone },
+          flat: { id: f.id, block: f.block.name, flatNumber: f.flatNumber, status: f.status },
           role: 'Tenant',
         })
       }
-
-      // Person with no flat linked
-      if (p.ownerships.length === 0 && p.tenancies.length === 0) {
+      if (f.ownerships.length === 0 && f.tenancies.length === 0) {
         results.push({
-          type:        'person',
-          matchedOn,
-          matchedValue: matchedOn === 'Name' ? p.name : p.phone,
-          person: {
-            id:       p.id,
-            name:     p.name,
-            phone:    p.phone,
-            altPhone: p.altPhone,
-            email:    p.email,
-          },
-          flat:     null,
-          vehicles: p.vehicles,
-          role:     null,
+          type: 'flat',
+          matchedOn: 'Flat No.',
+          matchedValue: `${f.block.name} · ${f.flatNumber}`,
+          person: null,
+          flat: { id: f.id, block: f.block.name, flatNumber: f.flatNumber, status: f.status },
+          role: null,
         })
+      }
+    }
+
+    // Process persons
+    for (const p of persons) {
+      const matchedOn = p.phone?.includes(q) ? 'Phone' : p.altPhone?.includes(q) ? 'Alt Phone' : 'Name'
+      const matchedValue = matchedOn === 'Name' ? p.name : p.phone
+
+      for (const o of p.ownerships) {
+        results.push({ type: 'person', matchedOn, matchedValue, person: { id: p.id, name: p.name, phone: p.phone, altPhone: p.altPhone, email: p.email }, flat: { id: o.flat.id, block: o.flat.block.name, flatNumber: o.flat.flatNumber, status: o.flat.status }, vehicles: p.vehicles, role: 'Owner' })
+      }
+      for (const t of p.tenancies) {
+        results.push({ type: 'person', matchedOn, matchedValue, person: { id: p.id, name: p.name, phone: p.phone, altPhone: p.altPhone, email: p.email }, flat: { id: t.flat.id, block: t.flat.block.name, flatNumber: t.flat.flatNumber, status: t.flat.status }, vehicles: p.vehicles, role: 'Tenant' })
+      }
+      if (p.ownerships.length === 0 && p.tenancies.length === 0) {
+        results.push({ type: 'person', matchedOn, matchedValue, person: { id: p.id, name: p.name, phone: p.phone, altPhone: p.altPhone, email: p.email }, flat: null, vehicles: p.vehicles, role: null })
       }
     }
 

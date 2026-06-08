@@ -11,49 +11,54 @@ const VehicleTypeEnum = z.enum(['CAR','BIKE','SCOOTER','CYCLE','OTHER'])
 // GET /residents
 router.get('/residents', async (req, res) => {
   try {
-    const { q, blockId } = req.query
+    const { q, blockId, page = '1', limit = '25' } = req.query
+    const pageNum = Math.max(1, parseInt(page as string, 10) || 1)
+    const take = Math.min(100, Math.max(5, parseInt(limit as string, 10) || 25))
+    const skip = (pageNum - 1) * take
 
     const where: any = { isActive: true }
 
     if (q) {
       where.OR = [
-        { name:  { contains: q as string, mode: 'insensitive' } },
+        { name: { contains: q as string, mode: 'insensitive' } },
         { phone: { contains: q as string } },
       ]
     }
 
     if (blockId) {
-      // Get flat IDs in that block first, then filter persons
-      const flatsInBlock = await prisma.flat.findMany({
-        where:  { blockId: blockId as string },
-        select: { id: true },
-      })
-      const flatIds = flatsInBlock.map((f: any) => f.id)
-
+      // Use nested relational filter to avoid fetching flat IDs first (prevents extra DB round-trip)
       where.OR = [
         ...(where.OR ?? []),
-        { ownerships: { some: { flatId: { in: flatIds }, endDate: null } } },
-        { tenancies:  { some: { flatId: { in: flatIds }, isActive: true } } },
+        { ownerships: { some: { flat: { blockId: blockId as string }, endDate: null } } },
+        { tenancies: { some: { flat: { blockId: blockId as string }, isActive: true } } },
       ]
     }
 
     const persons = await prisma.person.findMany({
       where,
-      include: {
+      select: {
+        id: true,
+        name: true,
+        phone: true,
+        altPhone: true,
+        email: true,
         ownerships: {
-          where:   { endDate: null },
-          include: { flat: { include: { block: { select: { name: true } } } } },
+          where: { endDate: null },
+          take: 1,
+          select: { flat: { select: { id: true, flatNumber: true, status: true, block: { select: { id: true, name: true } } } } },
         },
         tenancies: {
-          where:   { isActive: true },
-          include: { flat: { include: { block: { select: { name: true } } } } },
+          where: { isActive: true },
+          take: 1,
+          select: { flat: { select: { id: true, flatNumber: true, status: true, block: { select: { id: true, name: true } } } } },
         },
-        vehicles: { where: { isActive: true } },
+        vehicles: { where: { isActive: true }, select: { plateNumber: true, type: true } },
       },
       orderBy: { name: 'asc' },
-      take: 100,
+      skip,
+      take,
     })
-    return ok(res, persons)
+    return ok(res, { page: pageNum, limit: take, data: persons })
   } catch (err) { return handleError(res, err) }
 })
 

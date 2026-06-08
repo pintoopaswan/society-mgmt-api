@@ -189,4 +189,53 @@ router.patch('/payments/mark-overdue', async (req, res) => {
   } catch (err) { return handleError(res, err) }
 })
 
+// GET /payments/history?blockId=&flatId=
+router.get('/payments/history', async (req, res) => {
+  try {
+    const q = z.object({
+      blockId: z.string().optional(),
+      flatId: z.string().optional(),
+      blockName: z.string().optional(),
+      flatNumber: z.string().optional(),
+    }).parse(req.query)
+
+    let flatId: string | undefined
+
+    if (q.blockId && q.flatId) {
+      // prefer explicit IDs
+      const flat = await prisma.flat.findUnique({ where: { id: q.flatId } })
+      if (!flat || flat.blockId !== q.blockId) return error(res, 'Flat not found in block', 404)
+      flatId = q.flatId
+    } else if (q.blockName && q.flatNumber) {
+      const block = await prisma.block.findUnique({ where: { name: q.blockName } })
+      if (!block) return error(res, 'Block not found', 404)
+      const flat = await prisma.flat.findFirst({ where: { blockId: block.id, flatNumber: q.flatNumber } })
+      if (!flat) return error(res, 'Flat not found in block', 404)
+      flatId = flat.id
+    } else {
+      return error(res, 'Provide blockId+flatId or blockName+flatNumber', 400)
+    }
+
+    const maints = await prisma.maintenancePayment.findMany({ where: { flatId }, select: { id: true, billingMonth: true } })
+    if (maints.length === 0) return ok(res, [])
+
+    const maintIds = maints.map(m => m.id)
+
+    const transactions = await prisma.paymentTransaction.findMany({
+      where: { maintenanceId: { in: maintIds }, status: 'SUCCESS' },
+      include: { maintenance: { select: { billingMonth: true } } },
+      orderBy: { processedAt: 'asc' },
+    })
+
+    const result = transactions.map(t => ({
+      date: t.processedAt ?? t.createdAt,
+      amount: Number(t.amount),
+      billingMonth: t.maintenance?.billingMonth ?? null,
+      notes: t.notes ?? null,
+    }))
+
+    return ok(res, result)
+  } catch (err) { return handleError(res, err) }
+})
+
 export default router

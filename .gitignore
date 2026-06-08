@@ -1,2 +1,4 @@
 /migration
 /node_modules
+.vercel
+.env*
