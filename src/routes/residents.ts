@@ -79,12 +79,19 @@ router.get('/residents/:id', async (req, res) => {
 
 // POST /residents
 const personSchema = z.object({
-  name:         z.string().min(1),
-  phone:        z.string().min(7).max(15),
-  altPhone:     z.string().optional(),
-  email:        z.string().email().optional(),
-  aadhaarLast4: z.string().length(4).optional(),
-  panNumber:    z.string().optional(),
+  name:     z.string().min(1),
+  phone:    z.string().min(7).max(15),
+  altPhone: z.string().optional(),
+  email:    z.string().email().optional(),
+  // Treat empty strings as not-provided so sending "" won't fail validation
+  aadhaarLast4: z.preprocess((v) => {
+    if (typeof v === 'string' && v.trim() === '') return undefined
+    return v
+  }, z.string().length(4).optional()),
+  panNumber: z.preprocess((v) => {
+    if (typeof v === 'string' && v.trim() === '') return undefined
+    return v
+  }, z.string().optional()),
 })
 
 router.post('/residents', async (req, res) => {
@@ -187,6 +194,50 @@ router.post('/residents/:id/vehicle', async (req, res) => {
       data: { ...data, personId: req.params.id },
     })
     return created(res, vehicle)
+  } catch (err) { return handleError(res, err) }
+})
+
+// POST /residents/:id/vehicles  (bulk create)
+router.post('/residents/:id/vehicles', async (req, res) => {
+  try {
+    const bodySchema = z.object({
+      vehicles: z.array(z.object({
+        flatId:      z.string().uuid(),
+        type:        VehicleTypeEnum,
+        plateNumber: z.string().min(1),
+        make:        z.string().optional(),
+        model:       z.string().optional(),
+        color:       z.string().optional(),
+        parkingSlot: z.string().optional(),
+      })).min(1),
+    })
+
+    const { vehicles } = bodySchema.parse(req.body)
+
+    // Check duplicate plate numbers within the request (case-insensitive)
+    const normalized = vehicles.map(v => v.plateNumber.trim().toLowerCase())
+    const dupes = normalized.filter((p, i) => normalized.indexOf(p) !== i)
+    if (dupes.length) throw new Error(`Duplicate plate numbers in request: ${[...new Set(dupes)].join(', ')}`)
+
+    // Check for existing vehicles in DB with same plate numbers (case-insensitive)
+    const plateChecks = vehicles.map(v => ({ plateNumber: { equals: v.plateNumber, mode: 'insensitive' as any } }))
+    const existing = await prisma.vehicle.findMany({ where: { OR: plateChecks }, select: { plateNumber: true } })
+    if (existing.length) {
+      const plates = existing.map(e => e.plateNumber).join(', ')
+      throw new Error(`Plate number(s) already exist: ${plates}`)
+    }
+
+    // Transactional create: all succeed or all fail
+    const createdVehicles = await prisma.$transaction(async (tx) => {
+      const created: any[] = []
+      for (const v of vehicles) {
+        const rec = await tx.vehicle.create({ data: { ...v, personId: req.params.id } })
+        created.push(rec)
+      }
+      return created
+    })
+
+    return created(res, { count: createdVehicles.length, vehicles: createdVehicles })
   } catch (err) { return handleError(res, err) }
 })
 
