@@ -311,6 +311,7 @@ router.get('/payments/history/summary', async (req, res) => {
     const result = transactions.map(t => {
       const maint = maintMap[t.maintenanceId]
       return {
+        id:           maint?.id ?? t.maintenanceId,
         date:         t.processedAt ?? t.createdAt,
         amount:       Number(t.amount),
         mode:         t.mode,
@@ -489,4 +490,124 @@ router.post('/payments/record-by-flat', async (req, res) => {
     return ok(res, updated)
   } catch (err) { return handleError(res, err) }
 })
+// PATCH /payments/:id/edit
+// ─────────────────────────────────────────────────────────────────────────────
+// Edits an existing PAID maintenance record.
+//
+// Body (all optional — only provided fields are updated):
+//   mode      ONLINE|CASH|UPI|NEFT|CHEQUE
+//   paidAt    string (ISO date)
+//   amount    number (base amount, excl. lateFee)
+//   lateFee   number
+//   notes     string
+//
+// Side-effects when amount or lateFee change:
+//   - Updates maintenancePayment.amount / lateFee / totalAmount
+//   - Updates the latest PaymentTransaction.amount
+//   - Creates a correcting FundLedger entry (CREDIT if increase, DEBIT if decrease)
+// ─────────────────────────────────────────────────────────────────────────────
+router.patch('/payments/:id/edit', async (req, res) => {
+  try {
+    const body = z.object({
+      mode:    PaymentModeEnum.optional(),
+      paidAt:  z.string().datetime({ offset: true }).optional(),
+      amount:  z.number().positive().optional(),
+      lateFee: z.number().min(0).optional(),
+      notes:   z.string().optional(),
+    }).parse(req.body)
+
+    // ── 1. Load existing record ───────────────────────────────────────────────
+    const existing = await prisma.maintenancePayment.findUnique({
+      where: { id: req.params.id },
+      include: {
+        transactions: { orderBy: { createdAt: 'desc' }, take: 1 },
+        flat: { include: { block: { select: { name: true } } } },
+      },
+    })
+    if (!existing) return error(res, 'Payment record not found', 404)
+    if (existing.status !== 'PAID') return error(res, 'Only PAID records can be edited', 422)
+
+    // ── 2. Compute new amounts ────────────────────────────────────────────────
+    const newAmount   = body.amount   ?? Number(existing.amount)
+    const newLateFee  = body.lateFee  ?? Number(existing.lateFee)
+    const newTotal    = newAmount + newLateFee
+    const oldTotal    = Number(existing.totalAmount)
+    const amountDelta = newTotal - oldTotal            // positive = increase, negative = decrease
+    const amountChanged = amountDelta !== 0
+
+    const latestTx = existing.transactions[0]
+    const newPaidAt = body.paidAt ? new Date(body.paidAt) : undefined
+
+    // ── 3. Build transaction ops ──────────────────────────────────────────────
+    const txOps: any[] = [
+      // Always update the maintenance record
+      prisma.maintenancePayment.update({
+        where: { id: existing.id },
+        data: {
+          ...(body.amount   !== undefined && { amount: newAmount }),
+          ...(body.lateFee  !== undefined && { lateFee: newLateFee }),
+          ...(amountChanged                && { totalAmount: newTotal }),
+          ...(newPaidAt                    && { paidAt: newPaidAt }),
+        },
+      }),
+    ]
+
+    // Update mode / notes / processedAt on the latest transaction
+    if (latestTx && (body.mode || body.notes !== undefined || newPaidAt)) {
+      txOps.push(
+        prisma.paymentTransaction.update({
+          where: { id: latestTx.id },
+          data: {
+            ...(body.mode               && { mode: body.mode }),
+            ...(body.notes !== undefined && { notes: body.notes }),
+            ...(newPaidAt               && { processedAt: newPaidAt }),
+            ...(amountChanged           && { amount: newTotal }),
+          },
+        }),
+      )
+    }
+
+    // Correcting fund-ledger entry if amount changed
+    if (amountChanged) {
+      const blockName  = existing.flat?.block?.name ?? '?'
+      const flatNumber = existing.flat?.flatNumber  ?? '?'
+      txOps.push(
+        prisma.fundLedger.create({
+          data: {
+            entryType:   amountDelta > 0 ? 'CREDIT' : 'DEBIT',
+            amount:      Math.abs(amountDelta),
+            balance:     0,
+            description: `Payment correction — ${existing.billingMonth} (${blockName} / ${flatNumber})`,
+            referenceId: existing.id,
+            entryDate:   new Date(),
+          },
+        }),
+      )
+    }
+
+    await prisma.$transaction(txOps)
+
+    // ── 4. Return updated record ──────────────────────────────────────────────
+    const updated = await prisma.maintenancePayment.findUnique({
+      where: { id: existing.id },
+      include: {
+        flat: {
+          include: {
+            block:      { select: { name: true } },
+            ownerships: {
+              where:   { endDate: null },
+              include: { person: { select: { name: true, phone: true } } },
+              take: 1,
+            },
+          },
+        },
+        transactions: { orderBy: { createdAt: 'desc' }, take: 1 },
+        receipt:      true,
+      },
+    })
+
+    return ok(res, updated)
+  } catch (err) { return handleError(res, err) }
+})
+
 export default router
