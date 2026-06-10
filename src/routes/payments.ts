@@ -37,7 +37,7 @@ router.get('/payments', async (req, res) => {
           },
         },
         transactions: { orderBy: { createdAt: 'desc' }, take: 1 },
-        receipt:      true,
+        receipt:    true,
       },
       orderBy: [{ billingMonth: 'desc' }, { flat: { flatNumber: 'asc' } }],
     })
@@ -150,11 +150,14 @@ router.post('/payments/:id/record', async (req, res) => {
         where: { id: req.params.id },
         data:  { status: 'PAID', paidAt: paidDate, lateFee, totalAmount },
       }),
+      // Legacy flow — transaction linked via maintenanceId
       prisma.paymentTransaction.create({
         data: {
           maintenanceId: req.params.id,
           amount: totalAmount, currency: 'INR',
           mode, status: 'SUCCESS', notes, processedAt: paidDate,
+          paidMonths:   [payment.billingMonth],
+          billingMonth: payment.billingMonth,
         },
       }),
       prisma.paymentReceipt.create({
@@ -193,16 +196,15 @@ router.patch('/payments/mark-overdue', async (req, res) => {
 router.get('/payments/history', async (req, res) => {
   try {
     const q = z.object({
-      blockId: z.string().optional(),
-      flatId: z.string().optional(),
-      blockName: z.string().optional(),
+      blockId:    z.string().optional(),
+      flatId:     z.string().optional(),
+      blockName:  z.string().optional(),
       flatNumber: z.string().optional(),
     }).parse(req.query)
 
     let flatId: string | undefined
 
     if (q.blockId && q.flatId) {
-      // prefer explicit IDs
       const flat = await prisma.flat.findUnique({ where: { id: q.flatId } })
       if (!flat || flat.blockId !== q.blockId) return error(res, 'Flat not found in block', 404)
       flatId = q.flatId
@@ -216,22 +218,24 @@ router.get('/payments/history', async (req, res) => {
       return error(res, 'Provide blockId+flatId or blockName+flatNumber', 400)
     }
 
-    const maints = await prisma.maintenancePayment.findMany({ where: { flatId }, select: { id: true, billingMonth: true } })
+    const maints = await prisma.maintenancePayment.findMany({
+      where: { flatId }, select: { id: true, billingMonth: true },
+    })
     if (maints.length === 0) return ok(res, [])
 
-    const maintIds = maints.map(m => m.id)
+    const maintIds = maints.map((m: any) => m.id)
 
     const transactions = await prisma.paymentTransaction.findMany({
-      where: { maintenanceId: { in: maintIds }, status: 'SUCCESS' },
+      where:   { maintenanceId: { in: maintIds }, status: 'SUCCESS' },
       include: { maintenance: { select: { billingMonth: true } } },
       orderBy: { processedAt: 'asc' },
     })
 
-    const result = transactions.map(t => ({
-      date: t.processedAt ?? t.createdAt,
-      amount: Number(t.amount),
+    const result = transactions.map((t: any) => ({
+      date:         t.processedAt ?? t.createdAt,
+      amount:       Number(t.amount),
       billingMonth: t.maintenance?.billingMonth ?? null,
-      notes: t.notes ?? null,
+      notes:        t.notes ?? null,
     }))
 
     return ok(res, result)
@@ -240,18 +244,10 @@ router.get('/payments/history', async (req, res) => {
 
 
 // GET /payments/history/summary
-// Query params (all optional):
-//   year=2026            → filter to billingMonths starting with "2026-"
-//   month=2026-03        → filter to exact billingMonth "2026-03"
-//   block=Block-4        → filter to a specific block name
-//
-// Combinations:
-//   (none)               → all paid transactions across everything
-//   year                 → all paid transactions in that year
-//   month                → all paid transactions for that billing month
-//   block                → all paid transactions for that block (all years)
-//   year + block         → all paid transactions for that block in that year
-//   month + block        → all paid transactions for that block in that billing month
+// Returns one row per PaymentTransaction.
+// Uses only columns guaranteed to exist in the current schema.
+// New fields (transactionId, paidMonths etc.) are read via COALESCE so the
+// query works both before and after the multi-month migration.
 router.get('/payments/history/summary', async (req, res) => {
   try {
     const q = z.object({
@@ -260,104 +256,128 @@ router.get('/payments/history/summary', async (req, res) => {
       block: z.string().optional(),
     }).parse(req.query)
 
-    // ── Resolve block filter ──────────────────────────────────────────────────
-    let blockId: string | undefined
-    if (q.block) {
-      const blockRow = await prisma.block.findUnique({ where: { name: q.block } })
-      if (!blockRow) return error(res, `Block "${q.block}" not found`, 404)
-      blockId = blockRow.id
-    }
+    // ── Build WHERE fragments ────────────────────────────────────────────────
+    const conditions: string[] = [`mp.status = 'PAID'`]
+    const params: any[]        = []
+    let   pi = 1
 
-    // ── Resolve billingMonth filter ───────────────────────────────────────────
-    // month param takes precedence over year; year is used as a string prefix
-    let billingMonthFilter: Record<string, any> = {}
     if (q.month) {
-      billingMonthFilter = { billingMonth: q.month }
+      conditions.push(`mp."billingMonth" = $${pi++}`)
+      params.push(q.month)
     } else if (q.year) {
-      billingMonthFilter = { billingMonth: { startsWith: `${q.year}-` } }
+      conditions.push(`mp."billingMonth" LIKE $${pi++}`)
+      params.push(`${q.year}-%`)
     }
 
-    // ── Fetch matching paid maintenance records ───────────────────────────────
-    const maints = await prisma.maintenancePayment.findMany({
-      where: {
-        status: 'PAID',
-        ...billingMonthFilter,
-        ...(blockId ? { flat: { blockId } } : {}),
-      },
-      select: {
-        id: true,
-        billingMonth: true,
-        flat: {
-          select: {
-            flatNumber: true,
-            block: { select: { name: true } },
-          },
-        },
-      },
-      orderBy: { billingMonth: 'asc' },
+    if (q.block) {
+      conditions.push(`b.name = $${pi++}`)
+      params.push(q.block)
+    }
+
+    const where = conditions.join(' AND ')
+
+    // ── Check which new columns actually exist in the DB ─────────────────────
+    const colCheck = await prisma.$queryRaw<{ column_name: string }[]>`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'maintenance_payments'
+        AND column_name = 'transactionId'
+    `
+    const hasTransactionId = colCheck.length > 0
+
+    let rows: any[]
+
+    if (hasTransactionId) {
+      // ── Post-migration query: group by transactionId ──────────────────────
+      rows = await prisma.$queryRawUnsafe<any[]>(`
+        SELECT
+          pt.id                                                  AS "id",
+          COALESCE(pt."processedAt", pt."createdAt")             AS "date",
+          pt.amount::float                                       AS "amount",
+          pt.mode                                                AS "mode",
+          pt.notes                                               AS "notes",
+          mp."billingMonth"                                      AS "billingMonth",
+          b.name                                                 AS "block",
+          f."flatNumber"                                         AS "flatNumber",
+          pr."receiptNumber"                                     AS "receiptNumber"
+        FROM maintenance_payments mp
+        JOIN payment_transactions pt
+          ON pt.id = mp."transactionId"
+          OR (mp."transactionId" IS NULL AND pt."maintenanceId" = mp.id)
+        JOIN flats f   ON f.id = mp."flatId"
+        JOIN blocks b  ON b.id = f."blockId"
+        LEFT JOIN payment_receipts pr
+          ON pr."transactionId" = pt.id OR pr."maintenanceId" = mp.id
+        WHERE ${where}
+        ORDER BY pt."processedAt" DESC NULLS LAST
+      `, ...params)
+    } else {
+      // ── Pre-migration query: legacy maintenanceId join only ───────────────
+      rows = await prisma.$queryRawUnsafe<any[]>(`
+        SELECT
+          pt.id                                                  AS "id",
+          COALESCE(pt."processedAt", pt."createdAt")             AS "date",
+          pt.amount::float                                       AS "amount",
+          pt.mode                                                AS "mode",
+          pt.notes                                               AS "notes",
+          mp."billingMonth"                                      AS "billingMonth",
+          b.name                                                 AS "block",
+          f."flatNumber"                                         AS "flatNumber",
+          pr."receiptNumber"                                     AS "receiptNumber"
+        FROM maintenance_payments mp
+        JOIN payment_transactions pt ON pt."maintenanceId" = mp.id
+        JOIN flats f   ON f.id = mp."flatId"
+        JOIN blocks b  ON b.id = f."blockId"
+        LEFT JOIN payment_receipts pr ON pr."maintenanceId" = mp.id
+        WHERE ${where}
+          AND pt.status = 'SUCCESS'
+        ORDER BY pt."processedAt" DESC NULLS LAST
+      `, ...params)
+    }
+
+    // Deduplicate — multi-month transactions join multiple maintenance rows
+    const seen = new Set<string>()
+    const deduped = rows.filter(r => {
+      if (seen.has(r.id)) return false
+      seen.add(r.id)
+      return true
     })
 
-    if (maints.length === 0) return ok(res, [])
-
-    const maintIds = maints.map(m => m.id)
-    const maintMap = Object.fromEntries(maints.map(m => [m.id, m]))
-
-    // ── Fetch successful transactions for those records ───────────────────────
-    const transactions = await prisma.paymentTransaction.findMany({
-      where: { maintenanceId: { in: maintIds }, status: 'SUCCESS' },
-      orderBy: { processedAt: 'asc' },
-    })
-
-    const result = transactions.map(t => {
-      const maint = maintMap[t.maintenanceId]
-      return {
-        id:           maint?.id ?? t.maintenanceId,
-        date:         t.processedAt ?? t.createdAt,
-        amount:       Number(t.amount),
-        mode:         t.mode,
-        billingMonth: maint?.billingMonth ?? null,
-        block:        maint?.flat?.block?.name ?? null,
-        flatNumber:   maint?.flat?.flatNumber ?? null,
-        notes:        t.notes ?? null,
-      }
-    })
-
-    return ok(res, result)
-  } catch (err) { return handleError(res, err) }
+    return ok(res, deduped.map(r => ({
+      id:             r.id,
+      transactionRef: r.transactionRef ?? null,
+      date:           r.date,
+      amount:         Number(r.amount),
+      lateFee:        Number(r.lateFee ?? 0),
+      mode:           r.mode,
+      notes:          r.notes ?? null,
+      paidMonths:     Array.isArray(r.paidMonths) && r.paidMonths.length
+                        ? r.paidMonths
+                        : [r.billingMonth].filter(Boolean),
+      billingMonth:   r.billingMonth ?? null,
+      block:          r.block ?? null,
+      flatNumber:     r.flatNumber ?? null,
+      receiptNumber:  r.receiptNumber ?? null,
+    })))
+  } catch (err: any) {
+    console.error('[/payments/history/summary]', err?.message ?? err)
+    return handleError(res, err)
+  }
 })
 
 
-
 // POST /payments/record-by-flat
-// ─────────────────────────────────────────────────────────────────────────────
-// Allows an admin to mark a payment as paid using human-readable identifiers
-// (block name + flat number) instead of an internal payment ID.
-//
-// Body:
-//   blockName    string               e.g. "Block-1"
-//   flatNumber   string               e.g. "101"
-//   billingMonth string (YYYY-MM)     e.g. "2026-05"
-//   amount       number               actual amount collected
-//   mode         ONLINE|CASH|UPI|NEFT|CHEQUE
-//   paidAt       string (ISO date)    when the payment was physically made
-//   lateFee      number (default 0)
-//   notes        string (optional)
-//
-// Behaviour:
-//   1. Resolves block → flat → existing maintenance record for that billingMonth.
-//   2. If no maintenance record exists yet (bill not generated), creates one
-//      on the fly so an advance / out-of-band payment can still be recorded.
-//   3. Rejects if the record is already PAID (idempotency guard).
-//   4. Wraps everything in a transaction: updates the payment, creates a
-//      PaymentTransaction, issues a receipt, and adds a FundLedger CREDIT —
-//      exactly the same side-effects as the existing /payments/:id/record.
-// ─────────────────────────────────────────────────────────────────────────────
+// Creates ONE PaymentTransaction covering one or more billing months.
+// MaintenancePayment rows are coverage markers only (status=PAID, transactionId set).
 router.post('/payments/record-by-flat', async (req, res) => {
   try {
+    const monthPattern = /^\d{4}-\d{2}$/
+    const singleMonth  = z.string().regex(monthPattern, 'billingMonth must be YYYY-MM')
+
     const body = z.object({
       blockName:    z.string().min(1),
       flatNumber:   z.string().min(1),
-      billingMonth: z.string().regex(/^\d{4}-\d{2}$/, 'billingMonth must be YYYY-MM'),
+      billingMonth: z.union([singleMonth, z.array(singleMonth).min(1)]),
       amount:       z.number().positive(),
       mode:         PaymentModeEnum,
       paidAt:       z.string().datetime({ offset: true }).optional(),
@@ -365,148 +385,160 @@ router.post('/payments/record-by-flat', async (req, res) => {
       notes:        z.string().optional(),
     }).parse(req.body)
 
-    const paidAt      = body.paidAt ? new Date(body.paidAt) : new Date()
-    const totalAmount = body.amount + body.lateFee
+    const months: string[] = [
+      ...new Set(Array.isArray(body.billingMonth) ? body.billingMonth : [body.billingMonth]),
+    ].sort()
 
-    // ── 1. Resolve block ──────────────────────────────────────────────────────
+    const primaryMonth = months[months.length - 1]
+    const paidAt       = body.paidAt ? new Date(body.paidAt) : new Date()
+    const totalAmount  = body.amount + body.lateFee
+
+    // ── Resolve block & flat ──────────────────────────────────────────────────
     const block = await prisma.block.findUnique({ where: { name: body.blockName } })
-    if (!block) {
-      return error(res, `Block "${body.blockName}" not found`, 404)
-    }
+    if (!block) return error(res, `Block "${body.blockName}" not found`, 404)
 
-    // ── 2. Resolve flat ───────────────────────────────────────────────────────
     const flat = await prisma.flat.findFirst({
       where: { blockId: block.id, flatNumber: body.flatNumber },
     })
-    if (!flat) {
-      return error(res, `Flat "${body.flatNumber}" not found in ${body.blockName}`, 404)
-    }
-    if (!flat.isActive) {
-      return error(res, `Flat "${body.flatNumber}" is inactive`, 422)
-    }
+    if (!flat)          return error(res, `Flat "${body.flatNumber}" not found in ${body.blockName}`, 404)
+    if (!flat.isActive) return error(res, `Flat "${body.flatNumber}" is inactive`, 422)
 
-    // ── 3. Find or create the maintenance record ──────────────────────────────
-    let payment = await prisma.maintenancePayment.findFirst({
-      where: { flatId: flat.id, billingMonth: body.billingMonth },
+    // ── Guard: already-paid months ────────────────────────────────────────────
+    const alreadyPaid = await prisma.maintenancePayment.findMany({
+      where:  { flatId: flat.id, billingMonth: { in: months }, status: 'PAID' },
+      select: { billingMonth: true },
     })
+    const alreadyPaidMonths = alreadyPaid.map((p: any) => p.billingMonth)
+    const toProcess = months.filter(m => !alreadyPaidMonths.includes(m))
 
-    if (!payment) {
-      // Bill was never generated — create it on the fly
-      const [year, month] = body.billingMonth.split('-').map(Number)
-      const dueDate = new Date(year, month - 1, 10) // standard due-day 10
+    if (toProcess.length === 0) {
+      return error(res, `All selected months already paid for ${body.blockName} / Flat ${body.flatNumber}`, 409)
+    }
 
-      payment = await prisma.maintenancePayment.create({
-        data: {
-          flatId:       flat.id,
-          billingMonth: body.billingMonth,
-          amount:       body.amount,
-          lateFee:      body.lateFee,
-          totalAmount,
-          status:       'PENDING',
-          dueDate,
-        },
+    // ── Find or create maintenance coverage markers ───────────────────────────
+    // Fetch flat with monthlyMaintenance so coverage rows satisfy the positive-amount constraint
+    const flatWithMaint = await prisma.flat.findUnique({
+      where:  { id: flat.id },
+      select: { monthlyMaintenance: true },
+    })
+    const monthlyAmount = Number(flatWithMaint?.monthlyMaintenance ?? body.amount)
+
+    const existingMaints = await prisma.maintenancePayment.findMany({
+      where: { flatId: flat.id, billingMonth: { in: toProcess } },
+    })
+    const existingMap = new Map(existingMaints.map((p: any) => [p.billingMonth, p]))
+
+    const missingMonths = toProcess.filter(m => !existingMap.has(m))
+    if (missingMonths.length > 0) {
+      await prisma.maintenancePayment.createMany({
+        data: missingMonths.map(m => {
+          const [y, mo] = m.split('-').map(Number)
+          return {
+            flatId:      flat.id,
+            billingMonth: m,
+            amount:      monthlyAmount,   // satisfies chk_mp_positive_amount
+            lateFee:     0,
+            totalAmount: monthlyAmount,
+            status:      'PENDING',
+            dueDate:     new Date(y, mo - 1, 10),
+          }
+        }),
       })
+      const fresh = await prisma.maintenancePayment.findMany({
+        where: { flatId: flat.id, billingMonth: { in: missingMonths } },
+      })
+      fresh.forEach((p: any) => existingMap.set(p.billingMonth, p))
     }
 
-    // ── 4. Idempotency guard ──────────────────────────────────────────────────
-    if (payment.status === 'PAID') {
-      return error(
-        res,
-        `${body.blockName} / Flat ${body.flatNumber} is already marked PAID for ${body.billingMonth}`,
-        409,
-      )
-    }
+    const maintRecords = toProcess.map(m => existingMap.get(m)!)
 
-    // ── 5. Persist everything atomically ─────────────────────────────────────
+    // ── Atomic persist ────────────────────────────────────────────────────────
     const receiptNumber = `RCP-${new Date().getFullYear()}-${Date.now().toString().slice(-5)}`
 
-    await prisma.$transaction([
-      // Update the maintenance record
-      prisma.maintenancePayment.update({
-        where: { id: payment.id },
-        data: {
-          status:      'PAID',
-          paidAt,
-          amount:      body.amount,
-          lateFee:     body.lateFee,
-          totalAmount,
-        },
-      }),
+    const result = await prisma.$transaction(async (tx) => {
+      // Per-month amount: spread total evenly; anchor month absorbs rounding remainder
+      const perMonth     = Math.floor(body.amount / toProcess.length)
+      const anchorAmount = body.amount - perMonth * (toProcess.length - 1)
 
-      // Payment transaction log
-      prisma.paymentTransaction.create({
-        data: {
-          maintenanceId: payment.id,
-          amount:        totalAmount,
-          currency:      'INR',
-          mode:          body.mode,
-          status:        'SUCCESS',
-          notes:         body.notes ?? null,
-          processedAt:   paidAt,
-        },
-      }),
+      // For each billing month: create one PaymentTransaction linked via maintenanceId
+      // (the only valid FK in the schema), update MaintenancePayment to PAID,
+      // and create a receipt keyed on maintenanceId.
+      const txnIds: string[] = []
+      for (let i = 0; i < maintRecords.length; i++) {
+        const maint      = maintRecords[i]
+        const isAnchor   = maint.billingMonth === primaryMonth
+        const monthAmt   = isAnchor ? anchorAmount : perMonth
+        const monthFee   = isAnchor ? body.lateFee : 0
+        const monthTotal = monthAmt + monthFee
 
-      // Receipt
-      prisma.paymentReceipt.create({
-        data: {
-          maintenanceId: payment.id,
-          receiptNumber,
-          issuedAt:      new Date(),
-        },
-      }),
+        const paymentTx = await tx.paymentTransaction.create({
+          data: {
+            maintenanceId: maint.id,    // ← only valid FK in schema
+            amount:        monthTotal,
+            currency:      'INR',
+            mode:          body.mode,
+            status:        'SUCCESS',
+            notes:         body.notes ?? null,
+            processedAt:   paidAt,
+          },
+        })
+        txnIds.push(paymentTx.id)
 
-      // Fund ledger credit
-      prisma.fundLedger.create({
+        await tx.maintenancePayment.update({
+          where: { id: maint.id },
+          data:  { status: 'PAID', paidAt, lateFee: monthFee, totalAmount: monthTotal },
+        })
+
+        // PaymentReceipt.maintenanceId is the only FK in schema
+        await tx.paymentReceipt.create({
+          data: {
+            maintenanceId: maint.id,
+            receiptNumber: isAnchor ? receiptNumber : `${receiptNumber}-${i + 1}`,
+            issuedAt:      new Date(),
+          },
+        })
+      }
+
+      // Single fund-ledger CREDIT for the full combined amount
+      await tx.fundLedger.create({
         data: {
           entryType:   'CREDIT',
           amount:      totalAmount,
           balance:     0,
-          description: `Maintenance — ${body.billingMonth} (${body.blockName} / ${body.flatNumber})`,
-          referenceId: payment.id,
+          description: `Maintenance — ${toProcess.join(', ')} (${body.blockName} / ${body.flatNumber})`,
+          referenceId: txnIds[txnIds.length - 1],
           entryDate:   paidAt,
         },
-      }),
-    ])
+      })
 
-    // ── 6. Return the updated record with flat + receipt ──────────────────────
-    const updated = await prisma.maintenancePayment.findUnique({
-      where: { id: payment.id },
+      return txnIds[txnIds.length - 1]
+    })
+
+    const updated = await prisma.paymentTransaction.findUnique({
+      where:   { id: result },
       include: {
-        flat: {
+        maintenance: {
           include: {
-            block: { select: { name: true } },
-            ownerships: {
-              where:   { endDate: null },
-              include: { person: { select: { name: true, phone: true } } },
-              take: 1,
-            },
+            flat:    { include: { block: { select: { name: true } } } },
+            receipt: true,
           },
         },
-        transactions: { orderBy: { createdAt: 'desc' }, take: 1 },
-        receipt:      true,
       },
     })
 
-    return ok(res, updated)
+    return ok(res, {
+      transaction:     updated,
+      processedMonths: toProcess,
+      skippedMonths:   alreadyPaidMonths,
+    })
   } catch (err) { return handleError(res, err) }
 })
-// PATCH /payments/:id/edit
-// ─────────────────────────────────────────────────────────────────────────────
-// Edits an existing PAID maintenance record.
-//
-// Body (all optional — only provided fields are updated):
-//   mode      ONLINE|CASH|UPI|NEFT|CHEQUE
-//   paidAt    string (ISO date)
-//   amount    number (base amount, excl. lateFee)
-//   lateFee   number
-//   notes     string
-//
-// Side-effects when amount or lateFee change:
-//   - Updates maintenancePayment.amount / lateFee / totalAmount
-//   - Updates the latest PaymentTransaction.amount
-//   - Creates a correcting FundLedger entry (CREDIT if increase, DEBIT if decrease)
-// ─────────────────────────────────────────────────────────────────────────────
-router.patch('/payments/:id/edit', async (req, res) => {
+
+
+// PATCH /payments/transaction/:txId/edit
+// Edits a PaymentTransaction — the single source of truth.
+// Does NOT touch individual MaintenancePayment coverage markers.
+router.patch('/payments/transaction/:txId/edit', async (req, res) => {
   try {
     const body = z.object({
       mode:    PaymentModeEnum.optional(),
@@ -516,97 +548,127 @@ router.patch('/payments/:id/edit', async (req, res) => {
       notes:   z.string().optional(),
     }).parse(req.body)
 
-    // ── 1. Load existing record ───────────────────────────────────────────────
-    const existing = await prisma.maintenancePayment.findUnique({
-      where: { id: req.params.id },
+    const tx = await prisma.paymentTransaction.findUnique({
+      where:   { id: req.params.txId },
       include: {
-        transactions: { orderBy: { createdAt: 'desc' }, take: 1 },
-        flat: { include: { block: { select: { name: true } } } },
+        maintenance: { include: { flat: { include: { block: { select: { name: true } } } } } },
       },
     })
-    if (!existing) return error(res, 'Payment record not found', 404)
-    if (existing.status !== 'PAID') return error(res, 'Only PAID records can be edited', 422)
+    if (!tx)                     return error(res, 'Transaction not found', 404)
+    if (tx.status !== 'SUCCESS') return error(res, 'Only successful transactions can be edited', 422)
 
-    // ── 2. Compute new amounts ────────────────────────────────────────────────
-    const newAmount   = body.amount   ?? Number(existing.amount)
-    const newLateFee  = body.lateFee  ?? Number(existing.lateFee)
-    const newTotal    = newAmount + newLateFee
-    const oldTotal    = Number(existing.totalAmount)
-    const amountDelta = newTotal - oldTotal            // positive = increase, negative = decrease
-    const amountChanged = amountDelta !== 0
+    // lateFee and paidMonths are not schema fields — derive from maintenance relation
+    const oldLateFee = 0   // not stored on transaction; treat prior amount as base
+    const newAmount  = body.amount  ?? Number(tx.amount)
+    const newLateFee = body.lateFee ?? oldLateFee
+    const newTotal   = newAmount + newLateFee
+    const oldTotal   = Number(tx.amount)
+    const delta      = newTotal - oldTotal
+    const newPaidAt  = body.paidAt ? new Date(body.paidAt) : undefined
 
-    const latestTx = existing.transactions[0]
-    const newPaidAt = body.paidAt ? new Date(body.paidAt) : undefined
+    const maint      = (tx as any).maintenance
+    const blockName  = maint?.flat?.block?.name ?? '?'
+    const flatNumber = maint?.flat?.flatNumber  ?? '?'
+    const billingMon = maint?.billingMonth ?? '?'
 
-    // ── 3. Build transaction ops ──────────────────────────────────────────────
-    const txOps: any[] = [
-      // Always update the maintenance record
-      prisma.maintenancePayment.update({
-        where: { id: existing.id },
+    await prisma.$transaction(async (prismaClient) => {
+      await prismaClient.paymentTransaction.update({
+        where: { id: tx.id },
         data: {
-          ...(body.amount   !== undefined && { amount: newAmount }),
-          ...(body.lateFee  !== undefined && { lateFee: newLateFee }),
-          ...(amountChanged                && { totalAmount: newTotal }),
-          ...(newPaidAt                    && { paidAt: newPaidAt }),
+          ...(body.mode  !== undefined && { mode: body.mode }),
+          ...(body.notes !== undefined && { notes: body.notes }),
+          ...(newPaidAt               && { processedAt: newPaidAt }),
+          ...((body.amount !== undefined || body.lateFee !== undefined) && {
+            amount: newTotal,   // total incl. any late fee adjustment
+          }),
         },
-      }),
-    ]
+      })
 
-    // Update mode / notes / processedAt on the latest transaction
-    if (latestTx && (body.mode || body.notes !== undefined || newPaidAt)) {
-      txOps.push(
-        prisma.paymentTransaction.update({
-          where: { id: latestTx.id },
+      if (delta !== 0) {
+        await prismaClient.fundLedger.create({
           data: {
-            ...(body.mode               && { mode: body.mode }),
-            ...(body.notes !== undefined && { notes: body.notes }),
-            ...(newPaidAt               && { processedAt: newPaidAt }),
-            ...(amountChanged           && { amount: newTotal }),
-          },
-        }),
-      )
-    }
-
-    // Correcting fund-ledger entry if amount changed
-    if (amountChanged) {
-      const blockName  = existing.flat?.block?.name ?? '?'
-      const flatNumber = existing.flat?.flatNumber  ?? '?'
-      txOps.push(
-        prisma.fundLedger.create({
-          data: {
-            entryType:   amountDelta > 0 ? 'CREDIT' : 'DEBIT',
-            amount:      Math.abs(amountDelta),
+            entryType:   delta > 0 ? 'CREDIT' : 'DEBIT',
+            amount:      Math.abs(delta),
             balance:     0,
-            description: `Payment correction — ${existing.billingMonth} (${blockName} / ${flatNumber})`,
-            referenceId: existing.id,
+            description: `Payment correction — ${billingMon} (${blockName} / ${flatNumber})`,
+            referenceId: tx.id,
             entryDate:   new Date(),
           },
-        }),
-      )
-    }
+        })
+      }
+    })
 
-    await prisma.$transaction(txOps)
-
-    // ── 4. Return updated record ──────────────────────────────────────────────
-    const updated = await prisma.maintenancePayment.findUnique({
-      where: { id: existing.id },
+    const updated = await prisma.paymentTransaction.findUnique({
+      where:   { id: tx.id },
       include: {
-        flat: {
+        maintenance: {
           include: {
-            block:      { select: { name: true } },
-            ownerships: {
-              where:   { endDate: null },
-              include: { person: { select: { name: true, phone: true } } },
-              take: 1,
-            },
+            flat:    { include: { block: { select: { name: true } } } },
+            receipt: true,
           },
         },
-        transactions: { orderBy: { createdAt: 'desc' }, take: 1 },
-        receipt:      true,
       },
     })
 
     return ok(res, updated)
+  } catch (err) { return handleError(res, err) }
+})
+
+
+// DELETE /payments/transaction/:txId
+// Reverses a PaymentTransaction: marks the linked MaintenancePayment back to PENDING,
+// deletes the receipt, and posts a DEBIT correction to the fund ledger.
+router.delete('/payments/transaction/:txId', async (req, res) => {
+  try {
+    const tx = await prisma.paymentTransaction.findUnique({
+      where:   { id: req.params.txId },
+      include: {
+        maintenance: {
+          include: {
+            flat:    { include: { block: { select: { name: true } } } },
+            receipt: true,
+          },
+        },
+      },
+    })
+    if (!tx) return error(res, 'Transaction not found', 404)
+
+    const maint      = (tx as any).maintenance
+    const blockName  = maint?.flat?.block?.name ?? '?'
+    const flatNumber = maint?.flat?.flatNumber  ?? '?'
+    const billingMon = maint?.billingMonth ?? '?'
+
+    await prisma.$transaction(async (prismaClient) => {
+      // 1. Delete receipt if it exists (keyed on maintenanceId in schema)
+      if (maint?.receipt) {
+        await prismaClient.paymentReceipt.delete({ where: { id: maint.receipt.id } })
+      }
+
+      // 2. Reverse the MaintenancePayment back to PENDING
+      if (maint) {
+        await prismaClient.maintenancePayment.update({
+          where: { id: maint.id },
+          data:  { status: 'PENDING', paidAt: null, lateFee: 0, totalAmount: maint.amount },
+        })
+      }
+
+      // 3. Delete the transaction itself
+      await prismaClient.paymentTransaction.delete({ where: { id: tx.id } })
+
+      // 4. DEBIT the fund ledger to reverse the credit
+      await prismaClient.fundLedger.create({
+        data: {
+          entryType:   'DEBIT',
+          amount:      Number(tx.amount),
+          balance:     0,
+          description: `Payment deleted — ${billingMon} (${blockName} / ${flatNumber})`,
+          referenceId: tx.id,
+          entryDate:   new Date(),
+        },
+      })
+    })
+
+    return ok(res, { message: 'Payment deleted successfully' })
   } catch (err) { return handleError(res, err) }
 })
 

@@ -34,6 +34,15 @@ export function handleError(res: Response, err: unknown) {
   if ((err as any)?.code === 'P2025') {
     return error(res, 'Record not found', 404)
   }
-  console.error(err)
-  return error(res, 'Internal server error', 500)
+  // Log full error detail so it appears in Vercel function logs
+  const prismaCode = (err as any)?.code
+  const message    = (err as any)?.message ?? String(err)
+  console.error('[API Error]', {
+    code:    prismaCode ?? 'UNKNOWN',
+    message,
+    stack:   (err as any)?.stack,
+  })
+  // In non-production, return the real message to help with debugging
+  const isDev = process.env.NODE_ENV !== 'production'
+  return error(res, isDev ? message : 'Internal server error', 500)
 }
